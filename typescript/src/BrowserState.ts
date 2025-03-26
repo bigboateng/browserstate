@@ -1,408 +1,327 @@
 import { StorageProvider } from "./storage/StorageProvider";
+import { CloudStorageProvider } from "./storage/CloudStorageProvider";
 import { LocalStorage } from "./storage/LocalStorage";
 import { S3Storage } from "./storage/S3Storage";
 import { GCSStorage } from "./storage/GCSStorage";
 import fs from "fs-extra";
 import path from "path";
 import os from "os";
+import { SyncManager } from "./sync/SyncManager";
+import {
+  BrowserStateError,
+  StorageProviderError,
+  ValidationError,
+  ErrorCodes,
+} from "./errors";
 
 /**
- * Options for local file system storage
- */
-export interface LocalStorageOptions {
-  /**
-   * Path where browser profiles will be stored
-   */
-  storagePath?: string;
-}
-
-/**
- * Options for AWS S3 storage
- */
-export interface S3Options {
-  /**
-   * S3 bucket name for storing browser profiles
-   */
-  bucketName: string;
-
-  /**
-   * AWS region where the bucket is located
-   */
-  region: string;
-
-  /**
-   * AWS access key ID (optional if using environment variables or IAM roles)
-   */
-  accessKeyID?: string;
-
-  /**
-   * AWS secret access key (optional if using environment variables or IAM roles)
-   */
-  secretAccessKey?: string;
-
-  /**
-   * Optional prefix/folder path within the bucket
-   */
-  prefix?: string;
-}
-
-/**
- * Options for Google Cloud Storage
- */
-export interface GCSOptions {
-  /**
-   * GCS bucket name for storing browser profiles
-   */
-  bucketName: string;
-
-  /**
-   * Google Cloud project ID
-   */
-  projectID?: string;
-
-  /**
-   * Path to service account key file
-   */
-  keyFilename?: string;
-
-  /**
-   * Optional prefix/folder path within the bucket
-   */
-  prefix?: string;
-}
-
-/**
- * Configuration options for BrowserState
+ * Options for configuring BrowserState
  */
 export interface BrowserStateOptions {
-  /**
-   * User identifier for organizing storage (default: "default")
-   */
-  userId?: string;
-
-  /**
-   * Type of storage backend to use (default: "local")
-   */
-  storageType?: "local" | "s3" | "gcs";
-
-  /**
-   * Options for local storage
-   */
-  localOptions?: LocalStorageOptions;
-
-  /**
-   * Options for AWS S3 storage
-   */
-  s3Options?: S3Options;
-
-  /**
-   * Options for Google Cloud Storage
-   */
-  gcsOptions?: GCSOptions;
-
-  /**
-   * Whether to automatically clean up temporary files on process exit (default: true)
-   */
-  autoCleanup?: boolean;
+  userId: string;
+  storageType: "local" | "s3" | "gcs";
+  cleanupMode?: "exit-only" | "always";
+  useSync?: boolean;
+  syncOptions?: {
+    storeMetadataOnProvider: boolean;
+    metadataUpdateInterval: number;
+  };
+  localOptions?: {
+    storagePath?: string;
+  };
+  s3Options?: {
+    bucketName: string;
+    region: string;
+    accessKeyId: string;
+    secretAccessKey: string;
+  };
+  gcsOptions?: {
+    bucketName: string;
+    projectID: string;
+    keyFilename: string;
+    prefix?: string;
+  };
 }
 
 /**
- * BrowserState main class for managing browser profiles across storage providers
+ * Cleanup mode for browser state
+ */
+export type CleanupMode = "exit-only" | "always";
+
+/**
+ * Main BrowserState class for managing browser sessions
  */
 export class BrowserState {
-  private storageProvider: StorageProvider;
-  private userId: string;
-  private currentSession?: string;
-  private sessionPath?: string;
-  private tempDir: string;
-  private autoCleanup: boolean;
+  private storageProvider: StorageProvider | null = null;
+  private syncManager: SyncManager | null = null;
+  private isMounted = false;
+  private cleanupMode: CleanupMode;
+  private useSync: boolean;
+  private syncOptions: {
+    storeMetadataOnProvider: boolean;
+    metadataUpdateInterval: number;
+  };
+  private options: BrowserStateOptions;
+  private currentSession: string | null = null;
 
-  /**
-   * Creates a new BrowserState instance
-   *
-   * @param options - Configuration options
-   */
-  constructor(options: BrowserStateOptions = {}) {
-    // Set default user ID
-    this.userId = options.userId || "default";
-    this.autoCleanup = options.autoCleanup !== false;
-
-    // Create base temp directory for this instance
-    this.tempDir = path.join(os.tmpdir(), "browserstate", this.userId);
-    fs.ensureDirSync(this.tempDir);
-
-    // Create storage provider based on options
-    switch (options.storageType) {
-      case "s3":
-        if (!options.s3Options) {
-          throw new Error("S3 options required when using s3 storage");
-        }
-        this.storageProvider = new S3Storage(
-          options.s3Options.bucketName,
-          options.s3Options.region,
-          {
-            accessKeyId: options.s3Options.accessKeyID,
-            secretAccessKey: options.s3Options.secretAccessKey,
-            prefix: options.s3Options.prefix,
-          },
-        );
-        break;
-
-      case "gcs":
-        if (!options.gcsOptions) {
-          throw new Error("GCS options required when using gcs storage");
-        }
-        this.storageProvider = new GCSStorage(options.gcsOptions.bucketName, {
-          keyFilePath: options.gcsOptions.keyFilename,
-          projectID: options.gcsOptions.projectID,
-          prefix: options.gcsOptions.prefix,
-        });
-        break;
-
-      case "local":
-      default:
-        this.storageProvider = new LocalStorage(
-          options.localOptions?.storagePath,
-        );
-        break;
-    }
-
-    // Register cleanup handler for auto cleanup if enabled
-    if (this.autoCleanup) {
-      this.registerCleanupHandlers();
-    }
-  }
-
-  /**
-   * Register handlers to clean up temporary files on process exit
-   */
-  private registerCleanupHandlers(): void {
-    const cleanup = async (): Promise<void> => {
-      try {
-        // If a session is mounted, try to save it before exiting
-        if (this.currentSession && this.sessionPath) {
-          try {
-            await this.unmount();
-          } catch (error) {
-            console.error("Error saving session during cleanup:", error);
-          }
-        }
-
-        // Clean up temp directory
-        if (fs.existsSync(this.tempDir)) {
-          await fs.remove(this.tempDir);
-        }
-      } catch (error) {
-        console.error("Error during cleanup:", error);
-      }
+  constructor(options: BrowserStateOptions) {
+    this.options = options;
+    this.cleanupMode = options.cleanupMode || "exit-only";
+    this.useSync = options.useSync || false;
+    this.syncOptions = options.syncOptions || {
+      storeMetadataOnProvider: true,
+      metadataUpdateInterval: 60,
     };
-
-    // Handle normal exit
-    process.on("exit", () => {
-      // Sync cleanup for 'exit' event
-      if (fs.existsSync(this.tempDir)) {
-        try {
-          fs.removeSync(this.tempDir);
-        } catch (error) {
-          console.error("Error removing temp dir during exit:", error);
-        }
-      }
-    });
-
-    // Handle ctrl+c and other signals
-    process.on("SIGINT", async () => {
-      await cleanup();
-      process.exit(0);
-    });
-
-    // Handle uncaught exceptions
-    process.on("uncaughtException", async (error) => {
-      console.error("Uncaught exception:", error);
-      await cleanup();
-      process.exit(1);
-    });
+    this.validateOptions();
   }
 
   /**
-   * Mount a browser state session
-   *
-   * @param sessionId - Session identifier
-   * @returns Promise resolving to the path where browser can be launched
+   * Validate required options based on storage type
+   */
+  private validateOptions(): void {
+    if (!this.options.userId) {
+      throw new ValidationError("userId is required");
+    }
+
+    if (!this.options.storageType) {
+      throw new ValidationError("storageType is required");
+    }
+
+    switch (this.options.storageType) {
+      case "s3":
+        if (
+          !this.options.s3Options?.bucketName ||
+          !this.options.s3Options?.region ||
+          !this.options.s3Options?.accessKeyId ||
+          !this.options.s3Options?.secretAccessKey
+        ) {
+          throw new ValidationError(
+            "S3 options require bucketName, region, accessKeyId, and secretAccessKey",
+          );
+        }
+        break;
+      case "gcs":
+        if (
+          !this.options.gcsOptions?.bucketName ||
+          !this.options.gcsOptions?.projectID ||
+          !this.options.gcsOptions?.keyFilename
+        ) {
+          throw new ValidationError(
+            "GCS options require bucketName, projectID, and keyFilename",
+          );
+        }
+        break;
+    }
+  }
+
+  /**
+   * Create the appropriate storage provider
+   */
+  private createStorageProvider(): StorageProvider {
+    try {
+      switch (this.options.storageType) {
+        case "local":
+          return new LocalStorage(this.options.localOptions?.storagePath);
+        case "s3":
+          if (!this.options.s3Options) {
+            throw new ValidationError(
+              "S3 options are required for S3 storage type",
+            );
+          }
+          return new S3Storage(
+            this.options.s3Options.bucketName,
+            this.options.s3Options.region,
+            {
+              accessKeyId: this.options.s3Options.accessKeyId,
+              secretAccessKey: this.options.s3Options.secretAccessKey,
+            },
+          );
+        case "gcs":
+          if (!this.options.gcsOptions) {
+            throw new ValidationError(
+              "GCS options are required for GCS storage type",
+            );
+          }
+          return new GCSStorage(this.options.gcsOptions);
+        default:
+          throw new ValidationError(
+            `Unsupported storage type: ${this.options.storageType}`,
+          );
+      }
+    } catch (error) {
+      if (error instanceof ValidationError) {
+        throw error;
+      }
+      throw new StorageProviderError(
+        `Failed to create storage provider: ${error instanceof Error ? error.message : "Unknown error"}`,
+        ErrorCodes.UNKNOWN_ERROR,
+        this.options.storageType,
+      );
+    }
+  }
+
+  /**
+   * Mount a browser session
    */
   async mount(sessionId: string): Promise<string> {
-    if (!sessionId || typeof sessionId !== "string") {
-      throw new Error("Session ID must be a non-empty string");
+    if (this.isMounted) {
+      throw new BrowserStateError(
+        "Browser state is already mounted",
+        ErrorCodes.STATE_ERROR,
+      );
     }
 
     try {
-      console.log(
-        `⏳ Mounting browser state session: ${sessionId} for user: ${this.userId}`,
-      );
-
-      // If a session is already mounted, unmount it first
-      if (this.currentSession && this.sessionPath) {
-        console.log(
-          `ℹ️ Another session is currently mounted (${this.currentSession}). Unmounting it first...`,
-        );
-        await this.unmount();
+      // Create storage provider if not exists
+      if (!this.storageProvider) {
+        this.storageProvider = this.createStorageProvider();
       }
 
-      console.log(`🔍 Attempting to download state from storage provider...`);
-      // Download the session files to a local directory
-      const userDataDir = await this.storageProvider.download(
-        this.userId,
+      // Create temporary directory for browser state
+      const userDataDir = path.join(
+        os.tmpdir(),
+        "browserstate",
+        this.options.userId,
         sessionId,
       );
+      await fs.mkdir(userDataDir, { recursive: true });
 
-      // Keep track of the mounted session
+      // Download session data
+      await this.storageProvider.download(this.options.userId, sessionId);
+
+      // Initialize sync manager if enabled and using cloud storage
+      if (this.useSync && this.isCloudStorageProvider(this.storageProvider)) {
+        this.syncManager = new SyncManager(
+          this.storageProvider,
+          this.options.userId,
+          sessionId,
+          this.syncOptions,
+        );
+      }
+
+      this.isMounted = true;
       this.currentSession = sessionId;
-      this.sessionPath = userDataDir;
-
-      console.log(`✅ Browser state mounted successfully at: ${userDataDir}`);
       return userDataDir;
-    } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      console.error(`❌ Failed to mount session ${sessionId}: ${errorMessage}`);
-      throw new Error(`Failed to mount session ${sessionId}: ${errorMessage}`);
+    } catch (error) {
+      // Clean up temporary directory on error
+      try {
+        await fs.rm(
+          path.join(
+            os.tmpdir(),
+            "browserstate",
+            this.options.userId,
+            sessionId,
+          ),
+          { recursive: true, force: true },
+        );
+      } catch (cleanupError) {
+        console.error("Failed to clean up temporary directory:", cleanupError);
+      }
+
+      if (
+        error instanceof BrowserStateError ||
+        error instanceof StorageProviderError
+      ) {
+        throw error;
+      }
+      throw new BrowserStateError(
+        `Failed to mount browser state: ${error instanceof Error ? error.message : "Unknown error"}`,
+        ErrorCodes.UNKNOWN_ERROR,
+      );
     }
   }
 
   /**
-   * Unmount the current browser state session and upload changes
+   * Type guard to check if a storage provider is a cloud storage provider
+   */
+  private isCloudStorageProvider(
+    provider: StorageProvider,
+  ): provider is CloudStorageProvider {
+    return (
+      "deleteFile" in provider &&
+      "uploadFile" in provider &&
+      "downloadFile" in provider
+    );
+  }
+
+  /**
+   * Unmount the current browser session
    */
   async unmount(): Promise<void> {
-    if (!this.currentSession || !this.sessionPath) {
-      throw new Error("No session is currently mounted");
+    if (!this.isMounted) {
+      throw new BrowserStateError(
+        "Browser state is not mounted",
+        ErrorCodes.STATE_ERROR,
+      );
     }
 
     try {
-      console.log(`⏳ Unmounting session: ${this.currentSession}...`);
-      console.log(`🔄 Uploading changes to storage provider...`);
+      if (this.syncManager && this.currentSession) {
+        await this.syncManager.syncToCloud(
+          path.join(
+            os.tmpdir(),
+            "browserstate",
+            this.options.userId,
+            this.currentSession,
+          ),
+        );
+      }
 
-      // Upload any changes
-      await this.storageProvider.upload(
-        this.userId,
-        this.currentSession,
-        this.sessionPath,
+      if (this.cleanupMode === "always") {
+        await this.cleanup();
+      }
+
+      this.isMounted = false;
+      this.syncManager = null;
+      this.currentSession = null;
+    } catch (error) {
+      if (
+        error instanceof BrowserStateError ||
+        error instanceof StorageProviderError
+      ) {
+        throw error;
+      }
+      throw new BrowserStateError(
+        `Failed to unmount browser state: ${error instanceof Error ? error.message : "Unknown error"}`,
+        ErrorCodes.UNKNOWN_ERROR,
       );
-
-      console.log(`🧹 Cleaning up local files...`);
-      // Clean up local files
-      await fs.remove(this.sessionPath);
-
-      console.log(
-        `✅ Session ${this.currentSession} unmounted and saved successfully`,
-      );
-
-      // Reset session tracking
-      this.currentSession = undefined;
-      this.sessionPath = undefined;
-
-      return;
-    } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      console.error(`❌ Failed to unmount session: ${errorMessage}`);
-      throw new Error(`Failed to unmount session: ${errorMessage}`);
     }
   }
 
   /**
-   * Get the current session ID if one is mounted
-   *
-   * @returns The current session ID or undefined if no session is mounted
+   * Clean up temporary files
    */
-  getCurrentSession(): string | undefined {
-    return this.currentSession;
+  private async cleanup(): Promise<void> {
+    try {
+      await fs.rm(path.join(os.tmpdir(), "browserstate", this.options.userId), {
+        recursive: true,
+        force: true,
+      });
+    } catch (error) {
+      throw new BrowserStateError(
+        `Failed to clean up temporary files: ${error instanceof Error ? error.message : "Unknown error"}`,
+        ErrorCodes.UNKNOWN_ERROR,
+      );
+    }
   }
 
   /**
-   * Get the path to the current session if one is mounted
-   *
-   * @returns The path to the current session or undefined if no session is mounted
-   */
-  getCurrentSessionPath(): string | undefined {
-    return this.sessionPath;
-  }
-
-  /**
-   * List available browser state sessions
-   *
-   * @returns Promise resolving to array of session IDs
+   * List available sessions
    */
   async listSessions(): Promise<string[]> {
-    try {
-      return await this.storageProvider.listSessions(this.userId);
-    } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      console.error("Error listing sessions:", errorMessage);
-      return [];
+    if (!this.storageProvider) {
+      this.storageProvider = this.createStorageProvider();
     }
+    return this.storageProvider.listSessions(this.options.userId);
   }
 
   /**
-   * Check if a session exists
-   *
-   * @param sessionId - Session identifier to check
-   * @returns Promise resolving to true if the session exists
-   */
-  async hasSession(sessionId: string): Promise<boolean> {
-    if (!sessionId || typeof sessionId !== "string") {
-      return false;
-    }
-
-    try {
-      const sessions = await this.listSessions();
-      return sessions.includes(sessionId);
-    } catch {
-      return false;
-    }
-  }
-
-  /**
-   * Delete a browser state session
-   *
-   * @param sessionId - Session identifier
+   * Delete a session
    */
   async deleteSession(sessionId: string): Promise<void> {
-    if (!sessionId || typeof sessionId !== "string") {
-      throw new Error("Session ID must be a non-empty string");
+    if (!this.storageProvider) {
+      this.storageProvider = this.createStorageProvider();
     }
-
-    try {
-      // If this session is currently mounted, unmount it first
-      if (this.currentSession === sessionId && this.sessionPath) {
-        await this.unmount();
-      }
-
-      // Delete the session
-      await this.storageProvider.deleteSession(this.userId, sessionId);
-    } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      throw new Error(`Failed to delete session ${sessionId}: ${errorMessage}`);
-    }
-  }
-
-  /**
-   * Manually clean up temporary files
-   * This can be used if autoCleanup is disabled
-   */
-  async cleanup(): Promise<void> {
-    try {
-      if (this.currentSession && this.sessionPath) {
-        await this.unmount();
-      }
-
-      if (fs.existsSync(this.tempDir)) {
-        await fs.remove(this.tempDir);
-      }
-    } catch (error: unknown) {
-      const errorMessage =
-        error instanceof Error ? error.message : String(error);
-      throw new Error(`Failed to clean up temporary files: ${errorMessage}`);
-    }
+    await this.storageProvider.deleteSession(this.options.userId, sessionId);
   }
 }
